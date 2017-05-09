@@ -14,6 +14,7 @@ import numpy as np
 import scipy as sp
 from scipy import spatial
 import scipy.sparse.linalg as splinalg
+from scipy.optimize import minimize
 import os, os.path, sys, time, string
 
 import socket, fnmatch
@@ -1890,7 +1891,385 @@ class MatchingMeshesInterpolator(InterfaceInterpolator):
 
         for iDim in range(1):
             self.H_T.mult(self.fluidInterfaceRobinTemperature.getData(iDim), self.solidInterfaceRobinTemperature.getData(iDim))
-    
+
+
+class ProjectionInterpolator(InterfaceInterpolator):
+    """
+    Des
+    """
+
+    def __init__(self, Manager, FluidSolver, SolidSolver, mpiComm = None):
+        """
+        Des.
+        """
+
+        InterfaceInterpolator.__init__(self, Manager, FluidSolver, SolidSolver, mpiComm)
+
+        mpiPrint('\nSetting non matching meshes interpolator with consistent projection method...', mpiComm)
+
+        self.nf = self.manager.getNumberOfFluidInterfaceNodes()
+        self.ns = self.manager.getNumberOfSolidInterfaceNodes()
+        self.nf_loc = self.manager.getNumberOfLocalFluidInterfaceNodes()
+        self.ns_loc = self.manager.getNumberOfLocalSolidInterfaceNodes()
+        self.nDim = self.manager.getnDim()
+
+        self.generateInterfaceData()
+
+        self.H = InterfaceMatrix((self.nf,self.ns), self.mpiComm)
+        self.H_T = InterfaceMatrix((self.ns,self.nf), self.mpiComm)
+                 
+        solidInterfaceProcessors = self.manager.getSolidInterfaceProcessors()
+        fluidInterfaceProcessors = self.manager.getFluidInterfaceProcessors()
+        solidPhysicalInterfaceNodesDistribution = self.manager.getSolidPhysicalInterfaceNodesDistribution()
+
+        mpiPrint('\nBuilding interpolation matrix...', mpiComm)
+
+        if self.mpiComm != None:
+            for iProc in solidInterfaceProcessors:
+                if self.myid == iProc:
+                    localSolidInterface_array_X, localSolidInterface_array_Y, localSolidInterface_array_Z = self.SolidSolver.getNodalInitialPositions()
+                    self.SolidSolver.generateTopology()
+                    solidInterfaceTopology = self.SolidSolver.getInterfaceTopology()
+                    print len(solidInterfaceTopology)
+                    for jProc in fluidInterfaceProcessors:
+                        self.mpiComm.Send(localSolidInterface_array_X, dest=jProc, tag=1)
+                        self.mpiComm.Send(localSolidInterface_array_Y, dest=jProc, tag=2)
+                        self.mpiComm.Send(localSolidInterface_array_Z, dest=jProc, tag=3)
+                        if iProc != jProc:
+                            self.mpiComm.send(solidInterfaceTopology, dest=jProc, tag=4)
+                if self.myid in fluidInterfaceProcessors:
+                    sizeOfBuff = solidPhysicalInterfaceNodesDistribution[iProc]
+                    solidInterfaceBuffRcv_X = np.zeros(sizeOfBuff)
+                    solidInterfaceBuffRcv_Y = np.zeros(sizeOfBuff)
+                    solidInterfaceBuffRcv_Z = np.zeros(sizeOfBuff)
+                    self.mpiComm.Recv(solidInterfaceBuffRcv_X, iProc, tag=1)
+                    self.mpiComm.Recv(solidInterfaceBuffRcv_Y, iProc, tag=2)
+                    self.mpiComm.Recv(solidInterfaceBuffRcv_Z, iProc, tag=3)
+                    if self.myid != iProc:
+                        solidInterfaceTopology_Rcv = self.mpiComm.recv(source=iProc, tag=4)
+                    else:
+                        solidInterfaceTopology_Rcv = solidInterfaceTopology
+                    self.fillMatrix(solidInterfaceBuffRcv_X, solidInterfaceBuffRcv_Y, solidInterfaceBuffRcv_Z, solidInterfaceTopology_Rcv,  iProc)
+        else:
+            localSolidInterface_array_X, localSolidInterface_array_Y, localSolidInterface_array_Z = self.SolidSolver.getNodalInitialPositions()
+            self.SolidSolver.generateTopology()
+            solidInterfaceTopology = self.SolidSolver.getInterfaceTopology()
+            self.fillMatrix(localSolidInterface_array_X, localSolidInterface_array_Y, localSolidInterface_array_Z, solidInterfaceTopology, 0)
+
+        self.H.assemble()
+        self.H_T.assemble()
+
+        mpiPrint('\nInterpolation matrix is built.', mpiComm)
+
+    def fillMatrix(self, solidInterfaceBuffRcv_X, solidInterfaceBuffRcv_Y, solidInterfaceBuffRcv_Z, solidInterfaceTopology_Rcv, iProc):
+        """
+        Des.
+        """
+
+        cc = 0.5
+        tau = 0.5
+        epsilon = 1e-5
+            
+        KDTree = self.createKDTree(solidInterfaceBuffRcv_X, solidInterfaceBuffRcv_Y, solidInterfaceBuffRcv_Z)
+        localFluidInterface_array_X_init, localFluidInterface_array_Y_init, localFluidInterface_array_Z_init = self.FluidSolver.getNodalInitialPositions()
+        solidIndexing = self.manager.getSolidIndexing()
+        #print len(solidIndexing)
+        #print solidIndexing
+        numberNotFound = 0
+        for iVertex in range(self.nf_loc):
+            #print("Fluid node : {}".format(iVertex))
+            posX = localFluidInterface_array_X_init[iVertex]
+            posY = localFluidInterface_array_Y_init[iVertex]
+            posZ = localFluidInterface_array_Z_init[iVertex]
+            fluidPoint = np.array([posX, posY, posZ])
+            iGlobalVertexFluid = self.manager.getGlobalIndex('fluid', self.myid, iVertex)
+            # STEP 1 : Find the nearest neighbour
+            distance, jVertex = KDTree.query(fluidPoint, 1)
+            NN = np.array([solidInterfaceBuffRcv_X[jVertex], solidInterfaceBuffRcv_Y[jVertex], solidInterfaceBuffRcv_Z[jVertex]])
+            # STEP 2 : Get all the adjacents surface elements to this NN
+            #adjacentSurfaceElements = self.SolidSolver.getAdjacentSurfaceElements(jVertex)
+            adjacentSurfaceElements = solidInterfaceTopology_Rcv[jVertex]
+            # STEP 3  : For all adjacent elements, create triangular or biliniar patch (3D), or a simple edge (2D)
+            minDistElem = 1e12
+            elementFound = False
+            if self.nDim == 2:
+                print("2D HAS TO WAIT")
+            elif self.nDim == 3:
+                for element in adjacentSurfaceElements:
+                    if len(element) == 3:
+                        print("TRIANGULAR ELEMENTS HAVE TO WAIT")
+                    elif len(element) == 4:
+                        #extract the solver index of the nodes defning the element
+                        #print element
+                        NodeA, NodeB, NodeC, NodeD = element #each node is a tuple (index, x, y, z)
+                        solIndexA = NodeA[0]
+                        solIndexB = NodeB[0]
+                        solIndexC = NodeC[0]
+                        solIndexD = NodeD[0]
+                        PointA = np.array(NodeA[1:])
+                        PointB = np.array(NodeB[1:])
+                        PointC = np.array(NodeC[1:])
+                        PointD = np.array(NodeD[1:])
+                        uv0 = np.array([0.0, 0.0])
+                        #res = minimize(self.__Q4Dist, uv0, args = (PointA, PointB, PointC, PointD, fluidPoint),  method='BFGS', jac=self.__gradQ4Dist)
+                        res = minimize(self.__Q4Dist, uv0, args = (PointA, PointB, PointC, PointD, fluidPoint),  method='nelder-mead', jac=self.__gradQ4Dist)
+                        uv =  res.x
+                        #if iVertex == 198:
+                        #    print ("PROC {} , fluidPoint = {}".format(self.myid, fluidPoint))
+                        #    print ("PROC {} , NN = {}".format(self.myid, NN))
+                        #    print("PROC {} , uv = {}".format(self.myid, uv))
+                        #    print ("PROC {} , patch = {}".format(self.myid, (PointA, PointB, PointC, PointD)))
+                        if uv[0] >= -1-epsilon and uv[0] <= 1+epsilon and uv[1] >= -1-epsilon and uv[1] <= 1+epsilon :
+                            elementFound = True
+                            NA = 0.25*(1-uv[0])*(1-uv[1])
+                            NB = 0.25*(1+uv[0])*(1-uv[1])
+                            NC = 0.25*(1+uv[0])*(1+uv[1])
+                            ND = 0.25*(1-uv[0])*(1+uv[1])
+                            print 'FOUND'
+                            print("Fluid node : {}".format(fluidPoint))
+                            print ("PROC {} , patch = {}".format(self.myid, (PointA, PointB, PointC, PointD)))
+                            print("PROC {}, uv = {}".format(self.myid, uv))
+                            print res.nit
+                            print ("PROC {} , N = {}".format(self.myid, (NA, NB, NC, ND)))
+                            jGlobalVertexSolidA = solidIndexing[solIndexA]
+                            jGlobalVertexSolidB = solidIndexing[solIndexB]
+                            jGlobalVertexSolidC = solidIndexing[solIndexC]
+                            jGlobalVertexSolidD = solidIndexing[solIndexD]
+                            self.H.setValue((iGlobalVertexFluid,jGlobalVertexSolidA),NA)
+                            self.H.setValue((iGlobalVertexFluid,jGlobalVertexSolidB),NB)
+                            self.H.setValue((iGlobalVertexFluid,jGlobalVertexSolidC),NC)
+                            self.H.setValue((iGlobalVertexFluid,jGlobalVertexSolidD),ND)
+                            self.H_T.setValue((jGlobalVertexSolidA, iGlobalVertexFluid),NA)
+                            self.H_T.setValue((jGlobalVertexSolidB, iGlobalVertexFluid),NB)
+                            self.H_T.setValue((jGlobalVertexSolidC, iGlobalVertexFluid),NC)
+                            self.H_T.setValue((jGlobalVertexSolidD, iGlobalVertexFluid),ND)
+                            break
+                        else :
+                            solPoint = self.__Q4Patch(uv, PointA, PointB, PointC, PointD)
+                            distElem = np.linalg.norm(fluidPoint - solPoint)
+                            if distElem < minDistElem:
+                                #elementFound = True
+                                NA = 0.25*(1-uv[0])*(1-uv[1])
+                                NB = 0.25*(1+uv[0])*(1-uv[1])
+                                NC = 0.25*(1+uv[0])*(1+uv[1])
+                                ND = 0.25*(1-uv[0])*(1+uv[1])
+                                print NA+NB+NC+ND
+                                jGlobalVertexSolidA = solidIndexing[solIndexA]
+                                jGlobalVertexSolidB = solidIndexing[solIndexB]
+                                jGlobalVertexSolidC = solidIndexing[solIndexC]
+                                jGlobalVertexSolidD = solidIndexing[solIndexD]
+                                self.H.setValue((iGlobalVertexFluid,jGlobalVertexSolidA),NA)
+                                self.H.setValue((iGlobalVertexFluid,jGlobalVertexSolidB),NB)
+                                self.H.setValue((iGlobalVertexFluid,jGlobalVertexSolidC),NC)
+                                self.H.setValue((iGlobalVertexFluid,jGlobalVertexSolidD),ND)
+                                self.H_T.setValue((jGlobalVertexSolidA, iGlobalVertexFluid),NA)
+                                self.H_T.setValue((jGlobalVertexSolidB, iGlobalVertexFluid),NB)
+                                self.H_T.setValue((jGlobalVertexSolidC, iGlobalVertexFluid),NC)
+                                self.H_T.setValue((jGlobalVertexSolidD, iGlobalVertexFluid),ND)
+                                minDistElem = distElem
+                        #SolidSolverIndexA, CoordA = NodeA
+                        #SolidSolverIndexB, CoordB = NodeB
+                        #SolidSolverIndexC, CoordC = NodeC
+                        #SolidSolverIndexD, CoordD = NodeD
+                        #Find the parametric coordinate of the nearest point on the element (minimization problem)
+                        #Guess step
+                        #uv_n = np.array([0.5, 0.5])
+                        #uv_nM1 = uv_n.copy()
+                        #Point = self.__Q4Patch(uv_n[0], uv_n[1], PointA, PointB, PointC, PointD)
+                        #gamma_n = 3.0
+                        #dist = np.linalg.norm(fluidPoint - Point)
+                        #grad_n = self.__gradDist(fluidPoint, uv_n[0], uv_n[1], PointA, PointB, PointC, PointD)
+                        #Estimate first amount of move
+                        #search_dir = -grad_n/(np.linalg.norm(grad_n))
+                        #Point = self.__Q4Patch(uv_n[0]+gamma_n*search_dir[0], uv_n[1]+gamma_n*search_dir[1], PointA, PointB, PointC, PointD)
+                        #dist_guess = np.linalg.norm(fluidPoint - Point)
+                        #while dist_guess > dist + gamma_n*cc*np.dot(search_dir, grad_n):
+                        #    gamma_n *= tau
+                        #    Point = self.__Q4Patch(uv_n[0]+gamma_n*search_dir[0], uv_n[1]+gamma_n*search_dir[1], PointA, PointB, PointC, PointD)
+                        #    dist_guess = np.linalg.norm(fluidPoint - Point)
+                        #Gradient descent
+                        #nIter = 1
+                        #grad_nM1 = np.zeros(2)
+                        #minConv = False
+                        #while np.linalg.norm(grad_n) >= 1e-6 and nIter < 20:
+                        #    if nIter > 1:
+                        #        delta_uv = (uv_n - uv_nM1)
+                        #        delta_Grad = (grad_n - grad_nM1)
+                        #        gamma_n = np.dot(delta_uv, delta_Grad)/(np.linalg.norm(delta_Grad))**2
+                        #    uv_nP1 = uv_n - gamma_n*grad_n
+                        #    grad_nM1 = grad_n
+                        #    uv_nM1 = uv_n.copy()
+                        #    uv_n = uv_nP1.copy()
+                        #    grad_n = self.__gradDist(fluidPoint, uv_n[0], uv_n[1], PointA, PointB, PointC, PointD)
+                        #    nIter += 1
+                        #    if np.linalg.norm(grad_n) < 1e-6:
+                        #        minConv = True
+                        #if minConv:
+                            #Test if the node is in the element
+                        #    if uv_n[0] >= -1 and uv_n[0] <= 1 and uv_n[1] >= -1 and uv_n[1] <= 1 :
+                        #        elementFound = True
+                        #        break
+                    else :
+                        print("Elements with more than 5 nodes cannot be treated")
+            if not elementFound:
+                print "NOT FOUND !!!!!"
+                print("PROC {} , vertex {}".format(self.myid, iVertex))
+                print fluidPoint
+                numberNotFound += 1
+                #jGlobalVertexSolid = self.manager.getGlobalIndex('solid', iProc, jVertex)
+                #self.H.setValue((iGlobalVertexFluid,jGlobalVertexSolid),1.0)
+                #self.H_T.setValue((jGlobalVertexSolid, iGlobalVertexFluid),1.0)
+        print("PROC {} , Number of bad pairings :  {}".format(self.myid, numberNotFound))
+
+    def __Q4Patch(self, uv, A, B, C, D):
+        """
+        Des.
+        """
+
+        Point = 0.25*(1-uv[0])*(1-uv[1])*A + 0.25*(1+uv[0])*(1-uv[1])*B + 0.25*(1+uv[0])*(1+uv[1])*C + 0.25*(1-uv[0])*(1+uv[1])*D
+
+        return Point
+
+    def __Q4du(self, uv, A, B, C, D):
+        """
+        Des
+        """
+
+        ddu = -0.25*(1-uv[1])*A + 0.25*(1-uv[1])*B + 0.25*(1+uv[1])*C - 0.25*(1+uv[1])*D
+
+        return ddu
+
+    def __Q4dv(self, uv, A, B, C, D):
+        """
+        Des.
+        """
+
+        ddv = -0.25*(1-uv[0])*A - 0.25*(1+uv[0])*B + 0.25*(1+uv[0])*C + 0.25*(1-uv[0])*D
+
+        return ddv
+
+    def __Q4dudu(self, uv, A, B, C, D):
+        """
+        Des.
+        """
+
+        dudu = 0.0*A+0.0*B+0.0*C+0.0*D
+
+        return dudu
+
+    def __Q4dvdv(self, uv, A, B, C, D):
+        """
+        Des.
+        """
+
+        dvdv = 0.0*A+0.0*B+0.0*C+0.0*D
+
+        return dvdv
+
+    def __Q4dudv(self, uv, A, B, C, D):
+        """
+        Des.
+        """
+
+        dudv = 0.25*A - 0.25*B + 0.25*C - 0.25*D
+
+        return dudv
+
+    def __Q4dvdu(self, uv, A, B, C, D):
+        """
+        Des.
+        """
+
+        dvdu = 0.25*A -0.25*B + 0.25*C - 0.25*D
+
+        return dvdu
+
+    def __gradQ4Dist(self, uv, A, B, C, D, P):
+        """
+        Des.
+        """
+
+        Point = self.__Q4Patch(uv, A, B, C, D)
+        norm = np.linalg.norm(P - Point)
+
+        ddu = self.__Q4du(uv, A, B, C, D)
+        ddv = self.__Q4dv(uv, A, B, C, D)
+
+        grad = np.zeros(2)
+
+        if norm != 0:
+            grad[0] = (1/norm) * ( -(ddu[0]*(P[0]-Point[0])) - (ddu[1]*(P[1]-Point[1])) - (ddu[2]*(P[2]-Point[2])) )
+            grad[1] = (1/norm) * ( -(ddv[0]*(P[0]-Point[0])) - (ddv[1]*(P[1]-Point[1])) - (ddv[2]*(P[2]-Point[2])) )
+        
+        return grad
+
+    def __Q4Dist(self, uv, A, B, C, D, P):
+        """
+        Des.
+        """
+
+        Q4Point = self.__Q4Patch(uv, A, B, C, D)
+
+        distance = np.linalg.norm(Q4Point-P)
+
+        return distance
+
+    def interpolateFluidLoadsOnSolidMesh(self):
+        """
+        Description
+        """
+
+        for iDim in range(3):
+            self.H_T.mult(self.fluidInterfaceLoads.getData(iDim), self.solidInterfaceLoads.getData(iDim))
+
+    def interpolateSolidDisplacementOnFluidMesh(self):
+        """
+        Description.
+        """
+
+        for iDim in range(3):
+            self.H.mult(self.solidInterfaceDisplacement.getData(iDim), self.fluidInterfaceDisplacement.getData(iDim))
+
+    #def interpolateSolidHeatFluxOnFluidMesh(self):
+    #    """
+    #    Description.
+    #    """
+
+    #    for iDim in range(3):
+    #        self.H.mult(self.solidInterfaceHeatFlux.getData(iDim), self.fluidInterfaceHeatFlux.getData(iDim))
+
+    #def interpolateSolidTemperatureOnFluidMesh(self):
+    #    """
+    #    Description
+    #    """
+
+    #    for iDim in range(1):
+    #        self.H.mult(self.solidInterfaceTemperature.getData(iDim), self.fluidInterfaceTemperature.getData(iDim))
+
+    #def interpolateFluidHeatFluxOnSolidMesh(self):
+    #    """
+    #    Description.
+    #    """
+
+    #    for iDim in range(3):
+    #        self.H_T.mult(self.fluidInterfaceHeatFlux.getData(iDim), self.solidInterfaceHeatFlux.getData(iDim))
+    #    self.H_T.mult(self.fluidInterfaceNormalHeatFlux.getData(0), self.solidInterfaceNormalHeatFlux.getData(0))
+
+    #def interpolateFluidTemperatureOnSolidMesh(self):
+    #    """
+    #    Description.
+    #    """
+
+    #    for iDim in range(1):
+    #        self.H_T.mult(self.fluidInterfaceTemperature.getData(iDim), self.solidInterfaceTemperature.getData(iDim))
+
+    #def interpolateFluidRobinTemperatureOnSolidMesh(self):
+    #    """
+    #    Des.
+    #    """
+
+    #    for iDim in range(1):
+    #        self.H_T.mult(self.fluidInterfaceRobinTemperature.getData(iDim), self.solidInterfaceRobinTemperature.getData(iDim))
 
 class RBFInterpolator(InterfaceInterpolator):
     """
