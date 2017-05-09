@@ -78,7 +78,7 @@ class SU2Solver(FluidSolver):
                 Fx = self.SU2.GetVertexForceX(self.fluidInterfaceID, iVertex)
                 Fy = self.SU2.GetVertexForceY(self.fluidInterfaceID, iVertex)
                 Fz = self.SU2.GetVertexForceZ(self.fluidInterfaceID, iVertex)
-                Temp = self.SU2.GetVertexWallTemperature(self.fluidInterfaceID, iVertex)
+                Temp = self.SU2.GetVertexTemperature(self.fluidInterfaceID, iVertex)
                 self.nodalInitialPos_X[PhysicalIndex] = posX
                 self.nodalInitialPos_Y[PhysicalIndex] = posY
                 self.nodalInitialPos_Z[PhysicalIndex] = posZ
@@ -146,8 +146,8 @@ class SU2Solver(FluidSolver):
                     Fx = self.SU2.GetVertexForceX(self.fluidInterfaceID, iVertex)
                     Fy = self.SU2.GetVertexForceY(self.fluidInterfaceID, iVertex)
                     Fz = self.SU2.GetVertexForceZ(self.fluidInterfaceID, iVertex)
-                Temp = self.SU2.GetVertexWallTemperature(self.fluidInterfaceID, iVertex)
-                WallHF = self.SU2.GetVertexWallNormalHeatFlux(self.fluidInterfaceID, iVertex)
+                Temp = self.SU2.GetVertexTemperature(self.fluidInterfaceID, iVertex)
+                WallHF = self.SU2.GetVertexNormalHeatFlux(self.fluidInterfaceID, iVertex)
                 Qx = self.SU2.GetVertexHeatFluxX(self.fluidInterfaceID, iVertex)
                 Qy = self.SU2.GetVertexHeatFluxY(self.fluidInterfaceID, iVertex)
                 Qz = self.SU2.GetVertexHeatFluxZ(self.fluidInterfaceID, iVertex)
@@ -205,7 +205,6 @@ class SU2Solver(FluidSolver):
         Set the heat fluxes on the f/s boundary and update the multi-grid structure (if any).
         """
 
-        print "NORMAL HEAT FLUX TO FLUID"
         PhysicalIndex = 0
         for iVertex in range(self.nNodes):
             WallHF = 0.0
@@ -213,12 +212,11 @@ class SU2Solver(FluidSolver):
                 N = self.SU2.GetVertexUnitNormal(self.fluidInterfaceID, iVertex)
                 #In SU2, the surface normal is pointing inwards the fluid domain (meaning outwards the solid domain).
                 WallHF = HF_X[PhysicalIndex]*N[0] + HF_Y[PhysicalIndex]*N[1] + HF_Z[PhysicalIndex]*N[2]
-                print WallHF
-                self.SU2.SetVertexWallNormalHeatFlux(self.fluidInterfaceID, iVertex, WallHF)
+                self.SU2.SetVertexNormalHeatFlux(self.fluidInterfaceID, iVertex, WallHF)
                 PhysicalIndex += 1
 
         if self.fluidInterfaceID != None:
-            self.SU2.UpdateBoundaryConditions_HeatFlux(self.fluidInterfaceID)
+            self.SU2.MGUpdateBoundaryConditions_HeatFlux(self.fluidInterfaceID)
 
     def applyNodalTemperatures(self, Temperature, time):
         """
@@ -228,11 +226,11 @@ class SU2Solver(FluidSolver):
         PhysicalIndex = 0
         for iVertex in range(self.nNodes):
             if not self.SU2.IsAHaloNode(self.fluidInterfaceID, iVertex):
-                self.SU2.SetVertexWallTemperature(self.fluidInterfaceID, iVertex, Temperature[PhysicalIndex])
+                self.SU2.SetVertexTemperature(self.fluidInterfaceID, iVertex, Temperature[PhysicalIndex])
                 PhysicalIndex += 1
 
         if self.fluidInterfaceID != None:
-            self.SU2.UpdateBoundaryConditions_Temperature(self.fluidInterfaceID)
+            self.SU2.MGUpdateBoundaryConditions_Temperature(self.fluidInterfaceID)
 
     def setInitialInterfaceHeatFlux(self):
         """
@@ -242,11 +240,11 @@ class SU2Solver(FluidSolver):
         PhysicalIndex = 0
         for iVertex in range(self.nNodes):
             if not self.SU2.IsAHaloNode(self.fluidInterfaceID, iVertex):
-                self.SU2.SetVertexWallNormalHeatFlux(self.fluidInterfaceID, iVertex, self.QWallInit)
+                self.SU2.SetVertexNormalHeatFlux(self.fluidInterfaceID, iVertex, self.QWallInit)
                 PhysicalIndex += 1
 
         if self.fluidInterfaceID != None:
-            self.SU2.UpdateBoundaryConditions_HeatFlux(self.fluidInterfaceID)
+            self.SU2.MGUpdateBoundaryConditions_HeatFlux(self.fluidInterfaceID)
 
     def setInitialInterfaceTemperature(self):
         """
@@ -256,11 +254,11 @@ class SU2Solver(FluidSolver):
         PhysicalIndex = 0
         for iVertex in range(self.nNodes):
             if not self.SU2.IsAHaloNode(self.fluidInterfaceID, iVertex):
-                self.SU2.SetVertexWallTemperature(self.fluidInterfaceID, iVertex, self.TWallInit)
+                self.SU2.SetVertexTemperature(self.fluidInterfaceID, iVertex, self.TWallInit)
                 PhysicalIndex += 1
 
         if self.fluidInterfaceID != None:
-            self.SU2.UpdateBoundaryConditions_Temperature(self.fluidInterfaceID)
+            self.SU2.MGUpdateBoundaryConditions_Temperature(self.fluidInterfaceID)
 
     def update(self, dt):
         """
